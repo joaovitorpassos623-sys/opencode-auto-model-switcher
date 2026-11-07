@@ -40,6 +40,8 @@ const MODEL_COOLDOWN_MS = 60_000
 const PROVIDER_COOLDOWN_MS = 120_000
 const PROVIDER_DOWN_COOLDOWN_MS = 300_000
 
+type Cooldowns = { models: Record<string, number>; providers: Record<string, number> }
+
 type State = {
   version: number
   enabled: boolean
@@ -49,6 +51,7 @@ type State = {
   requireToolcall: boolean
   order: OrderEntry[]
   history: SwitchRecord[]
+  cooldowns: Cooldowns
 }
 
 function defaultState(): State {
@@ -61,7 +64,19 @@ function defaultState(): State {
     requireToolcall: true,
     order: DEFAULT_ORDER.map((m) => ({ ...m, enabled: true })),
     history: [],
+    cooldowns: { models: {}, providers: {} },
   }
+}
+
+function sanitizeCooldowns(raw: any): Record<string, number> {
+  const now = Date.now()
+  const out: Record<string, number> = {}
+  if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === "number" && Number.isFinite(v) && v > now) out[k] = v
+    }
+  }
+  return out
 }
 
 function loadState(): State {
@@ -95,6 +110,10 @@ function loadState(): State {
       requireToolcall: raw.requireToolcall !== false,
       order,
       history: Array.isArray(raw.history) ? raw.history.slice(-100) : [],
+      cooldowns: {
+        models: sanitizeCooldowns(raw.cooldowns?.models),
+        providers: sanitizeCooldowns(raw.cooldowns?.providers),
+      },
     }
   } catch {
     return base
@@ -153,9 +172,19 @@ export const AutoModelSwitcher = async ({ client }: any) => {
   const sessionHistory = new Map<string, string[]>()
   const pendingRetry = new Map<string, number>()
   const retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const noFitWarned = new Set<string>()
   const providerCache = { at: 0, providers: [] as any[] }
-  const modelCooldown = new Map<string, number>()
-  const providerCooldown = new Map<string, number>()
+  const modelCooldown = new Map<string, number>(Object.entries(state.cooldowns.models))
+  const providerCooldown = new Map<string, number>(Object.entries(state.cooldowns.providers))
+
+  function persist() {
+    const now = Date.now()
+    state.cooldowns = {
+      models: Object.fromEntries([...modelCooldown].filter(([, t]) => t > now)),
+      providers: Object.fromEntries([...providerCooldown].filter(([, t]) => t > now)),
+    }
+    saveState(state)
+  }
 
   async function log(level: "debug" | "info" | "warn" | "error", message: string, extra?: any) {
     try {
@@ -196,6 +225,11 @@ export const AutoModelSwitcher = async ({ client }: any) => {
     return p?.models?.[ref.modelID]
   }
 
+  function contextLimit(providers: any[], ref: ModelRef): number | undefined {
+    const limit = modelMeta(providers, ref)?.limit?.context
+    return typeof limit === "number" ? limit : undefined
+  }
+
   function indexOfModel(providerID?: string, modelID?: string) {
     if (!providerID || !modelID) return -1
     return state.order.findIndex((m) => m.providerID === providerID && m.modelID === modelID)
@@ -213,10 +247,34 @@ export const AutoModelSwitcher = async ({ client }: any) => {
   }
 
   function pickAvailable(providers: any[], from: number) {
-    for (let i = Math.max(0, from); i < state.order.length; i++) {
+    const n = state.order.length
+    if (!n) return -1
+    const start = ((from % n) + n) % n
+    for (let k = 0; k < n; k++) {
+      const i = (start + k) % n
       if (isUsable(providers, state.order[i])) return i
     }
     return -1
+  }
+
+  function betterContextModel(providers: any[], from: number, used: number, currentLimit: number) {
+    const n = state.order.length
+    if (!n) return -1
+    const start = ((from % n) + n) % n
+    const candidates: { i: number; limit: number }[] = []
+    for (let k = 0; k < n; k++) {
+      const i = (start + k) % n
+      if (!isUsable(providers, state.order[i])) continue
+      const limit = contextLimit(providers, state.order[i])
+      if (limit === undefined || limit <= currentLimit) continue
+      candidates.push({ i, limit })
+    }
+    if (!candidates.length) return -1
+    const comfy = candidates.find((c) => c.limit >= used / state.thresholdPct)
+    if (comfy) return comfy.i
+    const fits = candidates.find((c) => c.limit >= used)
+    if (fits) return fits.i
+    return candidates.reduce((a, b) => (b.limit > a.limit ? b : a)).i
   }
 
   async function lastAssistant(sessionID: string): Promise<any | undefined> {
@@ -251,7 +309,7 @@ export const AutoModelSwitcher = async ({ client }: any) => {
     const log = sessionHistory.get(sessionID) ?? []
     log.push(`${new Date(entry.time).toISOString()} ${from} -> ${to} (${reason})`)
     sessionHistory.set(sessionID, log.slice(-50))
-    saveState(state)
+    persist()
   }
 
   function chooseForSession(providers: any[], sessionID: string, last: any) {
@@ -260,19 +318,28 @@ export const AutoModelSwitcher = async ({ client }: any) => {
     if (intended === undefined) intended = lastPos >= 0 ? lastPos : 0
 
     let reason = ""
+    let noBetter = false
     if (last && lastPos >= 0 && intended <= lastPos) {
       const { pct, limit, used } = contextUsage(last, providers)
       if (limit && pct >= state.thresholdPct) {
-        intended = lastPos + 1
-        reason = `contexto ${(pct * 100).toFixed(1)}% (${used}/${limit}) >= ${(state.thresholdPct * 100).toFixed(0)}%`
+        const fit = betterContextModel(providers, lastPos + 1, used, limit)
+        if (fit >= 0) {
+          intended = fit
+          const newLimit = contextLimit(providers, state.order[fit])
+          reason = `contexto ${(pct * 100).toFixed(1)}% (${used}/${limit}) >= ${(state.thresholdPct * 100).toFixed(0)}%; janela ${limit} -> ${newLimit ?? "?"}`
+        } else {
+          intended = lastPos
+          noBetter = true
+          reason = `contexto ${(pct * 100).toFixed(1)}% (${used}/${limit}) >= ${(state.thresholdPct * 100).toFixed(0)}%; sem modelo com janela maior`
+        }
       }
     }
     const chosen = pickAvailable(providers, intended)
-    return { chosen, intended, reason }
+    return { chosen, intended, reason, noBetter }
   }
 
   async function applyModel(output: any, providers: any[], sessionID: string, last: any) {
-    const { chosen, reason } = chooseForSession(providers, sessionID, last)
+    const { chosen, reason, noBetter } = chooseForSession(providers, sessionID, last)
     if (chosen === -1) {
       await toast(
         "Nenhum modelo disponivel. Use o tool model_switcher_toggle para reativar modelos.",
@@ -289,9 +356,14 @@ export const AutoModelSwitcher = async ({ client }: any) => {
     sessionIndex.set(sessionID, chosen)
 
     if (before !== chosen) {
+      noFitWarned.delete(sessionID)
       record(sessionID, previous ?? "(novo)", keyOf(entry), reason || "selecao")
       await toast(`Modelo: ${keyOf(entry)}`, "info")
       await log("info", "model selected", { sessionID, model: keyOf(entry), reason: reason || "select" })
+    } else if (noBetter && !noFitWarned.has(sessionID)) {
+      noFitWarned.add(sessionID)
+      await toast("Contexto alto, mas nenhum modelo com janela maior disponivel. Permanecendo no modelo atual.", "warning")
+      await log("warn", "context threshold reached with no larger window", { sessionID, reason })
     }
   }
 
@@ -354,7 +426,10 @@ export const AutoModelSwitcher = async ({ client }: any) => {
       }
     }
     const idx = sessionID ? sessionIndex.get(sessionID) ?? 0 : 0
-    const nextIdx = pickAvailable(providers, idx + 1)
+    const nextIdx =
+      limit && pct >= state.thresholdPct
+        ? betterContextModel(providers, idx + 1, used ?? 0, limit)
+        : pickAvailable(providers, idx + 1)
     const next = nextIdx >= 0 ? state.order[nextIdx] : undefined
     return {
       enabled: state.enabled,
@@ -452,10 +527,16 @@ export const AutoModelSwitcher = async ({ client }: any) => {
               failRef.providerID,
               Date.now() + (c.providerDown ? PROVIDER_DOWN_COOLDOWN_MS : PROVIDER_COOLDOWN_MS)
             )
+            persist()
           }
 
           const base = lastPos >= 0 ? lastPos + 1 : (sessionID ? (sessionIndex.get(sessionID) ?? 0) + 1 : 0)
-          const nextIdx = pickAvailable(providers, base)
+          let nextIdx = -1
+          if (last) {
+            const used = contextUsage(last, providers).used
+            if (used > 0) nextIdx = betterContextModel(providers, base, used, -1)
+          }
+          if (nextIdx < 0) nextIdx = pickAvailable(providers, base)
           if (sessionID) sessionIndex.set(sessionID, nextIdx >= 0 ? nextIdx : state.order.length)
 
           const nextLabel = nextIdx >= 0 ? keyOf(state.order[nextIdx]) : "(nenhum)"
@@ -571,7 +652,7 @@ export const AutoModelSwitcher = async ({ client }: any) => {
           }
           const [moved] = state.order.splice(from, 1)
           state.order.splice(to, 0, moved)
-          saveState(state)
+          persist()
           return `Movido ${keyOf(moved)} para posicao ${to + 1}.`
         },
       }),
@@ -587,13 +668,13 @@ export const AutoModelSwitcher = async ({ client }: any) => {
         async execute(args) {
           if (args.scope === "plugin") {
             state.enabled = args.enabled !== false
-            saveState(state)
+            persist()
             return `Plugin ${state.enabled ? "ativado" : "desativado"}.`
           }
           const idx = (args.index ?? 0) - 1
           if (idx < 0 || idx >= state.order.length) return `Indice invalido. Use 1-${state.order.length}.`
           state.order[idx].enabled = args.enabled !== false
-          saveState(state)
+          persist()
           return `${keyOf(state.order[idx])} ${state.order[idx].enabled ? "ativado" : "desativado"}.`
         },
       }),
@@ -604,7 +685,7 @@ export const AutoModelSwitcher = async ({ client }: any) => {
         async execute(args) {
           const pct = Math.min(100, Math.max(1, args.percent)) / 100
           state.thresholdPct = pct
-          saveState(state)
+          persist()
           return `Limite de contexto definido para ${(pct * 100).toFixed(0)}%.`
         },
       }),
@@ -637,14 +718,14 @@ export const AutoModelSwitcher = async ({ client }: any) => {
             state.enabled = true
             state.autoRetry = true
           }
-          saveState(state)
+          persist()
           return `Reset aplicado (${scope}). Ordem inicial de prioridade restaurada.`
         },
       }),
     },
 
     dispose: async () => {
-      saveState(state)
+      persist()
     },
   }
 }

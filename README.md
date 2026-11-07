@@ -46,8 +46,10 @@ Nao e necessario editar `opencode.json`. Se quiser configurar explicitamente
   `session.messages`. Usa `tokens.total` (que a API entrega como
   `input + output + reasoning + cache.read + cache.write`) ou o mesmo somatorio.
   Compara com `model.limit.context`. Nao confunde tokens de saida com contexto total.
-- Ao atingir o limite (padrao 90%), a proxima mensagem passa para o proximo modelo que
-  comporte o contexto.
+- Ao atingir o limite (padrao 90%), a proxima mensagem passa para um modelo cuja janela
+  de contexto seja maior que a atual e comporte os tokens ja usados. Prefere uma janela
+  que mantenha o uso abaixo do limite configurado; se nenhum modelo tiver janela maior,
+  permanece no modelo atual (nao troca para um modelo menor nem fica ciclando na fila).
 - Fallback: o hook `event` escuta `session.error`, classifica o erro e marca cooldown do
   modelo/provedor, avanca a fila e (opcionalmente) tenta continuar automaticamente sem
   repetir trabalho ja concluido.
