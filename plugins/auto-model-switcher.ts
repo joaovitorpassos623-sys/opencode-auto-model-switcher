@@ -463,15 +463,6 @@ export const AutoModelSwitcher = async ({ client }: any) => {
     ].join("\n")
   }
 
-  function listText() {
-    return state.order
-      .map((e, i) => {
-        const flag = e.enabled ? "  " : "x "
-        return `${String(i + 1).padStart(2, " ")}. [${flag}] ${keyOf(e)}`
-      })
-      .join("\n")
-  }
-
   return {
     config: async (cfg: any) => {
       if (!state.enabled) return
@@ -623,8 +614,10 @@ export const AutoModelSwitcher = async ({ client }: any) => {
           else if (args.model) {
             const [pid, ...rest] = String(args.model).split("/")
             target = state.order.findIndex((e) => e.providerID === pid && e.modelID === rest.join("/"))
-          } else if (args.mode === "prev") target = cur - 1
-          else target = cur + 1
+          } else {
+            const n = state.order.length
+            target = n ? (args.mode === "prev" ? (cur - 1 + n) % n : (cur + 1) % n) : -1
+          }
           if (target < 0 || target >= state.order.length) {
             return `Indice invalido. Use 1-${state.order.length}.`
           }
@@ -711,6 +704,9 @@ export const AutoModelSwitcher = async ({ client }: any) => {
           if (scope === "order" || scope === "all") {
             state.order = DEFAULT_ORDER.map((m) => ({ ...m, enabled: true }))
             sessionIndex.clear()
+            modelCooldown.clear()
+            providerCooldown.clear()
+            noFitWarned.clear()
           }
           if (scope === "history" || scope === "all") state.history = []
           if (scope === "all") {
